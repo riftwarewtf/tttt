@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# pipeline leftovers
+*.deobf.luau
+*.devirt.luau
+*.protos.json
+*.path2d
+output/
+.DS_Store
