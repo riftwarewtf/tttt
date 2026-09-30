@@ -38,6 +38,12 @@ STAGE_ORDER = ["Detecting", "Running the script", "Following the payload",
 
 MAX_LOG_LINES = 2000
 
+# traceout.header's first line. A result that starts with it is the behaviour
+# trace, whatever was asked for: the plugin has no lifter for that VM, or
+# lifting was tried and fell back. The output itself is the only honest answer,
+# so the embed reads it rather than repeating the request.
+TRACE_MARK = "(dynamic trace)"
+
 
 class PipelineError(Exception):
     """A run that produced no output, with the reason to show the user."""
@@ -117,6 +123,7 @@ class Run:
         self.obfuscator = None          # plugin name
         self.confidence = None
         self.result = None              # deobfuscated text
+        self.lifted = None              # did the result come from the lifter?
         self.log = []
         self.error = None
         self.exit_code = None
@@ -199,6 +206,7 @@ class Run:
             if os.path.exists(out_path):
                 with open(out_path, encoding="utf-8", errors="replace") as f:
                     self.result = f.read()
+                self.lifted = TRACE_MARK not in self.result.split("\n", 1)[0]
             else:
                 raise PipelineError(self._guess_error())
         finally:

@@ -91,7 +91,7 @@ def finished(run, requester, settings, preview, truncated):
     e.title = "Deobfuscated `%s`" % run.name
     _source_fields(e, run)
     e.add_field(name="Mode",
-                value="Devirtualized" if run.devirt else "Behaviour trace")
+                value="Devirtualized" if run.lifted else "Behaviour trace")
     out_lines = run.result.count("\n") + 1
     e.add_field(name="Output", value="%s\n%s lines"
                 % (human(len(run.result.encode("utf-8", "replace"))), f"{out_lines:,}"))
@@ -102,9 +102,12 @@ def finished(run, requester, settings, preview, truncated):
     if truncated:
         e.description = (e.description or "") + \
             "\n-# The attachment is truncated: the full result is over the upload limit."
-    if not run.devirt and run.obfuscator != "generic":
+    if run.devirt and not run.lifted:
+        # asked for lifting and got a trace: say so, since the two read very
+        # differently - a trace has only the branches that actually ran
         e.description = (e.description or "") + \
-            "\n-# Lifting did not finish, so this is the behaviour trace: only the branches that ran."
+            "\n-# Lifting did not apply to this script, so this is the behaviour trace: " \
+            "only the branches that ran."
     return e
 
 

@@ -35,13 +35,14 @@ Give it the script in any of these ways:
 * paste a link: `{p}deobf https://pastebin.com/AbCd1234`
 * reply to a message that has the file or the link, and just say `{p}deobf`
 
-The obfuscator is detected automatically. Luraph v15 and IronBrew 1 are lifted
-back to real Luau (control flow, locals, closures, untaken branches); anything
-else gets a behaviour trace: everything the script does, written back as Luau.
+The obfuscator is detected automatically, Luraph down to the version it says it
+is. Luraph v14/v15 and IronBrew 1 are lifted back to real Luau (control flow,
+locals, closures, untaken branches); Luraph up to v13 and everything else get a
+behaviour trace: what the script does, written back as Luau.
 
 **Options**
 `--trace` - skip lifting and only trace, which is much faster
-`--obf NAME` - force a plugin instead of detecting (`luraph_v15`, `ironbrew1`, `generic`)
+`--obf NAME` - force a plugin instead of detecting (`luraph`, `ironbrew1`, `generic`)
 
 Limit: {mb} per script. Nothing is uploaded anywhere - the script runs locally \
 against a fake Roblox environment.

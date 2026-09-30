@@ -13,14 +13,18 @@ one embed the whole way, so a request is a single line in the channel.
 
 | Obfuscator | What comes back |
 |---|---|
-| Luraph v15 | **Devirtualized**: the VM's bytecode lifted back to Luau, with control flow, locals, closures and the branches that never ran |
+| Luraph v14, v15 and newer | **Devirtualized**: the VM's bytecode lifted back to Luau, with control flow, locals, closures and the branches that never ran |
 | IronBrew 1 | **Devirtualized**, same |
+| Luraph up to v13 | **Behaviour trace** — that generation is a different VM (a Lua 5.1 interpreter) and has no lifter yet |
 | anything else | **Behaviour trace**: everything the script does to its environment, written back as Luau — only the branches that actually ran |
+
+Luraph stamps its version into a comment at the top of every script it makes, so
+the embed names it exactly: `Luraph v14.4.2`.
 
 Options, anywhere in the command:
 
 * `--trace` — skip lifting and only trace. Much faster, much less memory.
-* `--obf NAME` — force a plugin instead of detecting it (`luraph_v15`,
+* `--obf NAME` — force a plugin instead of detecting it (`luraph`,
   `ironbrew1`, `generic`).
 
 `.help` prints the same thing in the channel.

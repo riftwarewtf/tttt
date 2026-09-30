@@ -41,7 +41,10 @@ documentation, including the Wispbyte steps.
   content and the bot silently never answers.
 - The generic plugin has no lifter, so `runner.Run` turns devirtualization off
   for it: leaving it on would spend the whole timeout to produce the same
-  trace.
+  trace. Whether the result actually came from the lifter is read back off the
+  output's first line (`runner.TRACE_MARK`), not from what was asked for - the
+  pipeline falls back to a trace on its own (a Luraph VM older than v14, or a
+  lift that failed), and the embed has to say which one it is.
 - A link anyone can type is fetched by the host, so `sources._public_host`
   refuses loopback, private, link-local and reserved addresses.
 - Discord edits are rate limited per channel; `embeds.Editor` never edits
