@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-deobf bot - a Discord front end for a deobf server.
+deobf bot - deobfuscate protected Roblox Luau scripts from Discord.
 
     .deobf <attachment, paste link, or a reply to either>
 
-The deobfuscating happens on a deobf server (the `web/` half of
-riftwarewtf/deobf): this process only takes the script off Discord, posts it to
-that server's HTTP API, follows the job's progress stream, and edits one embed
-until the finished Luau comes back. Nothing but discord.py and aiohttp is
-needed here - no Luau runtime, no pipeline, nothing to compile.
+This file is the whole bot. The deobfuscating itself is done by one of two
+engines, picked by whether DEOBF_API is set:
 
-    DISCORD_TOKEN=...  DEOBF_API=https://your-deobf-server  python main.py
+- **Local** (the default): the `deobf/` pipeline in this folder, one `deob.py`
+  subprocess per request. Nothing to set up - a token and a host, and it works.
+- **Remote**: a deobf server's HTTP API (the `web/` half of
+  riftwarewtf/deobf). Worth it when the work should happen somewhere with more
+  memory than the box running the bot, since lifting a big script wants a few
+  hundred MB.
+
+Both engines offer the same three calls, so the command and the embed never
+know which one is behind them.
+
+    DISCORD_TOKEN=... python main.py                      # local
+    DISCORD_TOKEN=... DEOBF_API=http://host:8000 python main.py
 
 See README.md for hosting, and .env.example for every setting.
 """
@@ -21,8 +29,12 @@ import json
 import logging
 import os
 import re
+import shutil
+import signal
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlparse, urlunparse
 
@@ -84,7 +96,8 @@ class Settings:
     def __init__(self):
         load_env()
         self.token = (os.environ.get("DISCORD_TOKEN") or "").strip()
-        self.api = (os.environ.get("DEOBF_API") or "http://127.0.0.1:8000").rstrip("/")
+        # empty = run the pipeline in this folder; set = use that server
+        self.api = (os.environ.get("DEOBF_API") or "").strip().rstrip("/")
         # only useful if the server sits behind something that checks it
         self.api_token = (os.environ.get("DEOBF_API_TOKEN") or "").strip()
         self.prefix = os.environ.get("BOT_PREFIX", ".")
@@ -97,6 +110,9 @@ class Settings:
         self.job_timeout = _int("JOB_TIMEOUT", 1800)
         self.cooldown = _int("USER_COOLDOWN", 10)
         self.max_inflight = _int("MAX_INFLIGHT", 4)
+        # local engine only: scripts deobfuscated at once on this machine. Each
+        # one can want a few hundred MB while lifting, so this stays small.
+        self.max_concurrency = _int("MAX_CONCURRENCY", 2)
 
         self.run_timeout = _int("DEOB_TIMEOUT", 90)
         self.run_budget = _int("DEOB_BUDGET", 30)
@@ -119,10 +135,10 @@ class Settings:
         return True
 
 
-# ---------------------------------------------------------------- the server
+# ---------------------------------------------------------------- the engines
 
-# The server's own stage names (jobs.STAGES), in the order a run goes through
-# them, with what to call them in the embed.
+# The pipeline's stage names (web/jobs.py STAGES), in the order a run goes
+# through them, with what to call them in the embed.
 STAGES = [("detect", "Detecting"), ("trace", "Running the script"),
           ("rerun", "Following the payload"), ("lift", "Lifting the bytecode"),
           ("polish", "Cleaning up"), ("done", "Writing the result")]
@@ -138,12 +154,17 @@ API_TIMEOUT = 60            # per request, except the progress stream
 SSE_IDLE = 120              # no event at all for this long means something broke
 
 
-class ApiError(Exception):
+class EngineError(Exception):
     """Something the user should see, already worded for them."""
 
 
 class Api:
-    """The deobf server's HTTP API, one session for the bot's lifetime."""
+    """A deobf server's HTTP API, one session for the bot's lifetime.
+
+    Engine interface: start(), run(job, options, progress), log_tail(job).
+    """
+
+    label = "server"
 
     def __init__(self, settings):
         self.cfg = settings
@@ -167,7 +188,7 @@ class Api:
             await self._session.close()
 
     def unreachable(self, exc):
-        return ApiError(
+        return EngineError(
             "The deobf server at `%s` is not answering (%s).\n"
             "Start one (`python web/server.py` in riftwarewtf/deobf, or its "
             "Dockerfile) and point `DEOBF_API` at it." % (self.base, type(exc).__name__))
@@ -179,12 +200,12 @@ class Api:
                                  timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 body = await r.text()
                 if r.status >= 400:
-                    raise ApiError(self._why(r.status, body))
+                    raise EngineError(self._why(r.status, body))
                 return json.loads(body) if body else {}
-        except ApiError:
+        except EngineError:
             raise
         except asyncio.TimeoutError:
-            raise ApiError("The deobf server took longer than %ds to answer." % timeout)
+            raise EngineError("The deobf server took longer than %ds to answer." % timeout)
         except aiohttp.ClientError as e:
             raise self.unreachable(e)
 
@@ -206,6 +227,56 @@ class Api:
         self.limits = h.get("limits") or {}
         return h
 
+    async def start(self):
+        """What this engine can do, for the startup log and `.status`."""
+        h = await self.health()
+        return {"where": self.base, "luau": h.get("luau"),
+                "max_input": (h.get("limits") or {}).get("max_upload"),
+                "queue": h.get("queue") or {},
+                "plugins": [p.get("label", p.get("name", "?"))
+                            for p in h.get("obfuscators") or []]}
+
+    async def run(self, job, options, progress):
+        """Submit the script and follow the server until the job ends."""
+        # latin-1 so every byte survives the JSON round trip: the server
+        # re-encodes the string the same way deob.py reads a file
+        state = await self.submit(job.data.decode("latin-1"), job.name, options)
+        job.update(state)
+        await progress(job)
+
+        # The server sends a state roughly three times a second while a job
+        # runs, so the deadline below is checked often enough without a timer.
+        deadline = time.monotonic() + self.cfg.job_timeout
+        final, late = None, False
+        events = self.follow(job.id)
+        try:
+            async for st in events:
+                job.update(st)
+                await progress(job)
+                if st.get("status") in ("done", "failed", "cancelled"):
+                    final = st
+                    break
+                if time.monotonic() > deadline:
+                    late = True
+                    break
+        finally:
+            # closes the streaming response; the generator is inside its
+            # `async with`, so letting it be collected later would leak it
+            await events.aclose()
+        if late:
+            await self.cancel(job.id)
+            raise EngineError("the job passed this bot's %ds limit and was cancelled"
+                              % self.cfg.job_timeout)
+        if final is None:
+            # the stream ended without a terminal state: ask outright
+            final = await self.job(job.id)
+            job.update(final)
+        if final.get("status") != "done":
+            raise EngineError(final.get("error") or "the server reported: %s"
+                              % final.get("status", "no result"))
+        job.result = await self.result(job.id)
+        job.note_lifted()
+
     async def submit(self, text, name, options):
         return await self._json("POST", "/api/jobs",
                                 {"source": text, "name": name, "options": options})
@@ -216,7 +287,7 @@ class Api:
     async def cancel(self, jid):
         try:
             await self._json("DELETE", "/api/jobs/" + jid, timeout=20)
-        except ApiError:
+        except EngineError:
             pass
 
     async def result(self, jid):
@@ -226,17 +297,19 @@ class Api:
                              timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as r:
                 body = await r.text()
                 if r.status >= 400:
-                    raise ApiError(self._why(r.status, body))
+                    raise EngineError(self._why(r.status, body))
                 return body
-        except ApiError:
+        except EngineError:
             raise
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             raise self.unreachable(e)
 
-    async def log_tail(self, jid, lines=60):
+    async def log_tail(self, job, lines=60):
+        if not job.id:
+            return []
         try:
-            out = await self._json("GET", "/api/jobs/%s/log" % jid, timeout=20)
-        except ApiError:
+            out = await self._json("GET", "/api/jobs/%s/log" % job.id, timeout=20)
+        except EngineError:
             return []
         return (out.get("lines") or [])[-lines:]
 
@@ -253,7 +326,7 @@ class Api:
         try:
             async with s.get(url, timeout=timeout) as r:
                 if r.status >= 400:
-                    raise ApiError(self._why(r.status, await r.text()))
+                    raise EngineError(self._why(r.status, await r.text()))
                 event, data = None, []
                 async for raw in r.content:
                     line = raw.decode("utf-8", "replace").rstrip("\r\n")
@@ -270,12 +343,228 @@ class Api:
                         if event == "end":
                             return
                         event, data = None, []
-        except ApiError:
+        except EngineError:
             raise
         except asyncio.TimeoutError:
-            raise ApiError("The deobf server stopped sending progress for %ds." % SSE_IDLE)
+            raise EngineError("The deobf server stopped sending progress for %ds." % SSE_IDLE)
         except aiohttp.ClientError as e:
             raise self.unreachable(e)
+
+
+class Local:
+    """The `deobf/` pipeline in this folder, one subprocess per request.
+
+    deob.py keeps module-level state (a Path2D cache, the last raw run), so it
+    must never be imported into a long-lived process - the upstream CLAUDE.md
+    says so under "Usage". Every request is its own process in its own temp
+    folder, exactly as the web server does it.
+
+    Engine interface: start(), run(job, options, progress), log_tail(job).
+    """
+
+    label = "local"
+
+    # the pipeline's own `[*] ...` progress lines, mapped to stages. First
+    # match wins, so the order is the order of a run.
+    MARKS = [
+        ("Running the script", re.compile(r"^\[\*\] (tracing|replaying|\d+ Path2D)")),
+        ("Following the payload",
+         re.compile(r"^\[\*\] (script loadstring'd|anti-tamper|the script never finished)")),
+        ("Lifting the bytecode", re.compile(r"^\[\*\] devirtualiz")),
+        ("Lifting the bytecode", re.compile(r"^\[\*\] (constant|devirt round|  )")),
+        ("Cleaning up", re.compile(r"^\[\*\] (patched|\d+ flattened)")),
+        ("Writing the result", re.compile(r"^\[\+\] result:")),
+    ]
+    MAX_LOG = 2000
+
+    def __init__(self, settings):
+        self.cfg = settings
+        self.deob = os.path.join(HERE, "deobf", "deob.py")
+        self.sem = asyncio.Semaphore(max(1, settings.max_concurrency))
+        self.waiting = 0
+
+    def ready(self):
+        """Is the pipeline here, with the Luau runtime it needs?"""
+        exe = ".exe" if os.name == "nt" else ""
+        bin_dir = os.path.join(HERE, "deobf", "bin")
+        return (os.path.exists(self.deob)
+                and all(os.path.exists(os.path.join(bin_dir, n + exe))
+                        for n in ("luau", "luau-ast")))
+
+    def missing(self):
+        if not os.path.exists(self.deob):
+            return EngineError(
+                "The `deobf/` pipeline is missing from this folder, and `DEOBF_API` "
+                "is not set, so there is nothing to deobfuscate with. Re-clone the "
+                "repository, or point `DEOBF_API` at a deobf server.")
+        return EngineError(
+            "`deobf/bin/luau` and `deobf/bin/luau-ast` are missing or not executable. "
+            "A zip download drops the executable bit - clone the repository instead, "
+            "or run `chmod +x deobf/bin/*` (start.sh does it for you).")
+
+    async def start(self):
+        if not self.ready():
+            raise self.missing()
+        return {"where": "this machine", "luau": True,
+                "max_input": None, "queue": {"capacity": self.cfg.max_concurrency},
+                "plugins": await self._plugins()}
+
+    async def _plugins(self):
+        """What the local pipeline supports, straight from its registry."""
+        code = ("import sys; sys.path.insert(0, %r); import obfuscators; "
+                "print('|'.join(p.label for p in obfuscators.PLUGINS))"
+                % os.path.join(HERE, "deobf"))
+        code_out, _ = await self._exec([sys.executable, "-c", code], timeout=60)
+        return [p for p in (code_out or "").strip().split("|") if p]
+
+    async def close(self):
+        pass
+
+    # -- running -------------------------------------------------------
+
+    async def _exec(self, argv, timeout):
+        """Run a command to completion: (stdout+stderr, exit code)."""
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=HERE, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=env, start_new_session=True)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            _kill(proc)
+            await proc.wait()
+            raise EngineError("the pipeline did not answer within %ds" % timeout)
+        return out.decode("utf-8", "replace"), proc.returncode
+
+    async def detect(self, path):
+        """`deob.py --detect`: (plugin name, confidence, label)."""
+        out, code = await self._exec([sys.executable, self.deob, path, "--detect"], 120)
+        if code != 0:
+            raise EngineError((out or "detection failed").strip()[-300:])
+        parts = out.strip().splitlines()[-1].split("\t")
+        if len(parts) != 3:
+            raise EngineError("unexpected detector output: " + out.strip()[:200])
+        conf = None if parts[1] == "forced" else float(parts[1])
+        return parts[0], conf, parts[2]
+
+    async def run(self, job, options, progress):
+        if not self.ready():
+            raise self.missing()
+        self.waiting += 1
+        job.queued_behind = self.waiting - 1
+        try:
+            await progress(job)
+            await self.sem.acquire()
+        finally:
+            self.waiting -= 1
+        try:
+            await self._run_job(job, options, progress)
+        finally:
+            self.sem.release()
+
+    async def _run_job(self, job, options, progress):
+        workdir = tempfile.mkdtemp(prefix="deobbot_")
+        job.scrub = workdir
+        try:
+            in_path = os.path.join(workdir, job.name)
+            out_path = os.path.join(workdir, "result", job.name)
+            with open(in_path, "wb") as f:
+                f.write(job.data)
+
+            plugin = options.get("obfuscator")
+            if plugin:
+                job.note_detected(plugin + " (forced)", None)
+            else:
+                job.note_stage("Detecting")
+                await progress(job)
+                plugin, conf, label = await self.detect(in_path)
+                job.note_detected(label, conf)
+            await progress(job)
+
+            argv = [sys.executable, self.deob, in_path, "-o", out_path,
+                    "--obfuscator", plugin,
+                    "--timeout", str(options.get("timeout", self.cfg.run_timeout)),
+                    "--budget", str(options.get("budget", self.cfg.run_budget)),
+                    "--executor", str(options.get("executor", self.cfg.executor))]
+            if options.get("no_devirt"):
+                argv.append("--no-devirt")
+            await self._stream(job, argv, progress)
+
+            if not os.path.exists(out_path):
+                raise EngineError(job.guess_error())
+            with open(out_path, encoding="utf-8", errors="replace") as f:
+                job.result = f.read()
+            job.note_lifted()
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+            job.scrub = None
+
+    async def _stream(self, job, argv, progress):
+        """Run the pipeline, turning its output into stages as it goes."""
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=HERE, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=env, start_new_session=True, limit=1024 * 1024)
+        job.proc = proc
+        deadline = time.monotonic() + self.cfg.job_timeout
+        timed_out = False
+        try:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    timed_out = True
+                    break
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), left)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    break
+                except ValueError:
+                    # one line longer than the stream limit: keep going
+                    job.add_log("[!] a very long output line was dropped")
+                    continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if not line:
+                    continue
+                job.add_log(line)
+                for stage, rx in self.MARKS:
+                    if rx.match(line):
+                        job.note_stage(stage)
+                        await progress(job)
+                        break
+        finally:
+            job.proc = None
+        if timed_out:
+            _kill(proc)
+            await proc.wait()
+            raise EngineError("the run hit the %ds limit" % self.cfg.job_timeout)
+        job.exit_code = await proc.wait()
+
+    async def log_tail(self, job, lines=60):
+        return job.log[-lines:]
+
+    async def cancel(self, jid):
+        """Nothing to cancel remotely; the subprocess dies with its task."""
+
+
+def _kill(proc):
+    """The pipeline starts its own children, so the whole group goes."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:                                # noqa: BLE001 - already gone
+        try:
+            proc.kill()
+        except Exception:                            # noqa: BLE001
+            pass
+
+
+def pick_engine(settings):
+    """The remote engine when DEOBF_API is set, the local one otherwise."""
+    return Api(settings) if settings.api else Local(settings)
 
 
 # ---------------------------------------------------------------- the input
@@ -457,12 +746,48 @@ class Job:
         self.error = None
         self.started = time.monotonic()
         self.server_elapsed = None
+        self.log = []                   # the local engine's pipeline output
+        self.exit_code = None
+        self.proc = None
+        self.scrub = None               # temp folder to keep out of the log
 
     @property
     def elapsed(self):
         if self.server_elapsed is not None:
             return self.server_elapsed
         return time.monotonic() - self.started
+
+    def note_stage(self, stage):
+        self.stage = stage
+
+    def note_detected(self, label, confidence):
+        self.detected = label
+        self.confidence = confidence
+
+    def note_lifted(self):
+        """Did the result come from the lifter, or is it the behaviour trace?
+
+        Read off the output itself: the pipeline falls back to a trace on its
+        own (a Luraph VM older than v14, a lift that failed), so what was asked
+        for is not the answer.
+        """
+        self.lifted = TRACE_MARK not in (self.result or "").split("\n", 1)[0]
+
+    def add_log(self, line):
+        if self.scrub:
+            line = line.replace(os.path.join(self.scrub, "result"), "output")
+            line = line.replace(self.scrub + os.sep, "").replace(self.scrub, "")
+        if len(self.log) < Local.MAX_LOG:
+            self.log.append(line)
+        elif len(self.log) == Local.MAX_LOG:
+            self.log.append("[!] log truncated")
+
+    def guess_error(self):
+        """Why a local run produced nothing, in the pipeline's own words."""
+        for line in reversed(self.log):
+            if line.startswith("[!]"):
+                return line[4:].strip()
+        return "the pipeline produced no output (exit %s)" % self.exit_code
 
     def update(self, state):
         """Take in one `state` event from the server."""
@@ -608,8 +933,8 @@ behaviour trace: what the script does, written back as Luau.
 `--trace` - skip lifting and only trace, which is much faster
 `--obf NAME` - force a plugin instead of detecting (`luraph`, `ironbrew1`, `generic`)
 
-Limit: {mb} per script. The work runs on a deobf server, which never fetches
-anything the script asks for - a `HttpGet` is recorded, not followed.
+Limit: {mb} per script. The script is run against a fake Roblox environment,
+and nothing it asks for is ever fetched - a `HttpGet` is recorded, not followed.
 """
 
 
@@ -619,29 +944,28 @@ class Bot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.cfg = settings
-        self.api = Api(settings)
+        self.engine = pick_engine(settings)
         self.cooldowns = {}
         self.inflight = 0
 
     async def setup_hook(self):
-        """Say up front whether the server is there, rather than per request."""
+        """Check the engine once, here, instead of per request."""
         try:
-            h = await self.api.health()
-        except ApiError as e:
+            info = await self.engine.start()
+        except EngineError as e:
             log.warning("%s", e)
             return
-        limit = (h.get("limits") or {}).get("max_upload")
-        if limit:
-            # the server decides what it accepts; do not promise more
-            self.cfg.max_input_bytes = min(self.cfg.max_input_bytes, int(limit))
-        names = ", ".join(p.get("label", p.get("name", "?")) for p in h.get("obfuscators") or [])
-        log.info("deobf server %s: luau=%s, plugins: %s", self.cfg.api, h.get("luau"), names)
-        if not h.get("luau"):
-            log.warning("the server has no Luau runtime: every job there will fail "
+        if info.get("max_input"):
+            # the engine decides what it accepts; do not promise more
+            self.cfg.max_input_bytes = min(self.cfg.max_input_bytes, int(info["max_input"]))
+        log.info("engine: %s (%s), plugins: %s", self.engine.label,
+                 info.get("where"), ", ".join(info.get("plugins") or []) or "?")
+        if not info.get("luau"):
+            log.warning("no Luau runtime: every job will fail "
                         "(python deobf/build_luau.py --portable)")
 
     async def close(self):
-        await self.api.close()
+        await self.engine.close()
         await super().close()
 
     async def on_ready(self):
@@ -680,22 +1004,23 @@ class Bot(discord.Client):
 
     async def status(self, message):
         try:
-            h = await self.api.health()
-        except ApiError as e:
+            info = await self.engine.start()
+        except EngineError as e:
             await message.reply(embed=notice(str(e), BAD_COLOUR), mention_author=False)
             return
-        q = h.get("queue") or {}
-        # The server has no authentication of its own, so its address is only
-        # shown to whoever runs the bot, not to the channel.
+        q = info.get("queue") or {}
+        # A deobf server has no authentication of its own, so its address goes
+        # only to whoever runs the bot, never to the channel.
         owner = message.author.id in self.cfg.owner_ids
-        where = "`%s`" % self.cfg.api if owner else "(hidden)"
+        where = info.get("where") if (owner or self.engine.label == "local") else "(hidden)"
         await message.reply(embed=notice(
-            "**Server** %s\nLuau runtime: %s\nQueue: %s running, %s waiting "
-            "(capacity %s)\nUpload limit: %s\nIn flight from this bot: %d"
-            % (where, "yes" if h.get("luau") else "**no**",
+            "**Engine** %s - `%s`\nLuau runtime: %s\nQueue: %s running, %s waiting "
+            "(capacity %s)\nScript limit: %s\nIn flight from this bot: %d\nPlugins: %s"
+            % (self.engine.label, where, "yes" if info.get("luau") else "**no**",
                q.get("running", "?"), q.get("queued", "?"), q.get("capacity", "?"),
-               human(int((h.get("limits") or {}).get("max_upload") or 0)), self.inflight),
-            self.cfg.embed_colour, title="deobf server"), mention_author=False)
+               human(self.cfg.max_input_bytes), self.inflight,
+               ", ".join(info.get("plugins") or []) or "?"),
+            self.cfg.embed_colour, title="deobf"), mention_author=False)
 
     async def handle(self, message, args):
         wait = self._cooling(message.author.id)
@@ -779,14 +1104,18 @@ class Bot(discord.Client):
             return
         editor = Editor(card)
         ticker = asyncio.create_task(self._tick(editor, job))
+
+        async def progress(j):
+            await editor.show(progress_embed(j, self.cfg))
+
         try:
-            await self._run(editor, job, options)
-        except ApiError as e:
+            await self.engine.run(job, options, progress)
+        except EngineError as e:
             job.error = str(e)
         except asyncio.CancelledError:
             job.error = "the bot was shutting down"
             if job.id:
-                await self.api.cancel(job.id)
+                await self.engine.cancel(job.id)
             raise
         except Exception as e:                       # noqa: BLE001 - shown in the embed
             log.exception("job failed")
@@ -794,48 +1123,6 @@ class Bot(discord.Client):
         finally:
             ticker.cancel()
         await self.deliver(editor, job)
-
-    async def _run(self, editor, job, options):
-        """Submit the script and follow the server until the job ends."""
-        # latin-1 so every byte survives the JSON round trip: the server
-        # re-encodes the string the same way deob.py reads a file
-        text = job.data.decode("latin-1")
-        state = await self.api.submit(text, job.name, options)
-        job.update(state)
-        await editor.show(progress_embed(job, self.cfg))
-
-        # The server sends a state roughly three times a second while a job
-        # runs, so the deadline below is checked often enough without a timer.
-        deadline = time.monotonic() + self.cfg.job_timeout
-        final, late = None, False
-        events = self.api.follow(job.id)
-        try:
-            async for st in events:
-                job.update(st)
-                await editor.show(progress_embed(job, self.cfg))
-                if st.get("status") in ("done", "failed", "cancelled"):
-                    final = st
-                    break
-                if time.monotonic() > deadline:
-                    late = True
-                    break
-        finally:
-            # closes the streaming response; the generator is inside its
-            # `async with`, so letting it be collected later would leak it
-            await events.aclose()
-        if late:
-            await self.api.cancel(job.id)
-            raise ApiError("the job passed this bot's %ds limit and was cancelled"
-                           % self.cfg.job_timeout)
-        if final is None:
-            # the stream ended without a terminal state: ask outright
-            final = await self.api.job(job.id)
-            job.update(final)
-        if final.get("status") != "done":
-            raise ApiError(final.get("error") or "the server reported: %s"
-                           % final.get("status", "no result"))
-        job.result = await self.api.result(job.id)
-        job.lifted = TRACE_MARK not in job.result.split("\n", 1)[0]
 
     async def _tick(self, editor, job):
         """Refresh the embed while nothing else happens, for the clock."""
@@ -849,8 +1136,8 @@ class Bot(discord.Client):
     async def deliver(self, editor, job):
         if job.result is None:
             files = []
-            if self.cfg.attach_log and job.id:
-                tail = "\n".join(await self.api.log_tail(job.id, LOG_TAIL))
+            if self.cfg.attach_log:
+                tail = "\n".join(await self.engine.log_tail(job, LOG_TAIL))
                 if tail:
                     files.append(discord.File(io.BytesIO(tail.encode("utf-8", "replace")),
                                               filename="pipeline.log"))
@@ -914,7 +1201,9 @@ def main():
             "No bot token.\n"
             "  Put DISCORD_TOKEN=... in a .env file next to main.py (copy .env.example),\n"
             "  or set it as an environment variable in your host's panel.")
-    log.info("deobf server: %s", settings.api)
+    engine = pick_engine(settings)
+    log.info("engine: %s (%s)", engine.label,
+             settings.api or os.path.join(HERE, "deobf"))
     Bot(settings).run(settings.token, log_handler=None)
 
 

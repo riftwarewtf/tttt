@@ -10,6 +10,10 @@ cd "$(dirname "$0")"
 PY="${PYTHON:-python3}"
 command -v "$PY" >/dev/null 2>&1 || PY=python
 
+# A zip download (rather than a clone) drops the executable bit, and then
+# every local job fails with "permission denied" on the Luau runtime.
+chmod +x deobf/bin/luau deobf/bin/luau-ast 2>/dev/null || true
+
 if ! "$PY" -c "import discord, aiohttp" >/dev/null 2>&1; then
     echo "[*] installing dependencies..."
     "$PY" -m pip install --user --no-input --disable-pip-version-check -r requirements.txt \

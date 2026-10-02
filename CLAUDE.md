@@ -9,61 +9,83 @@ link, or a reply to a message with either) and sends readable Luau back, editing
 one embed from "queued" to the finished file. `README.md` is the user-facing
 documentation, including the Wispbyte steps.
 
-**The bot does no deobfuscating.** It posts the script to a **deobf server** -
-the `web/` half of [riftwarewtf/deobf](https://github.com/riftwarewtf/deobf) -
-and follows that job. So this repository is one file plus its packaging: no
-pipeline, no Luau binaries, two pip dependencies.
+**A token is the only thing that has to be set.** That is the point of the
+layout: the pipeline ships with the bot and runs on the same host by default.
 
 ## Layout
 
-- `main.py` - everything, in five sections: settings (`.env` + environment),
-  the API client (`Api`), the input (paste links, the SSRF guard), the embed
-  (`Job`, the `*_embed` builders, `Editor`), and the Discord client (`Bot`).
-- `start.sh` - the same thing for a host that runs one command; installs the
-  dependencies on first boot.
-- `.env.example` - every setting, annotated. `requirements.txt` - discord.py,
-  aiohttp.
+- `main.py` - the whole bot, in five sections: settings (`.env` +
+  environment), the engines (`Api`, `Local`), the input (paste links, the SSRF
+  guard), the embed (`Job`, the `*_embed` builders, `Editor`), and the Discord
+  client (`Bot`).
+- `deobf/` - **a copy of the pipeline from
+  [riftwarewtf/deobf](https://github.com/riftwarewtf/deobf)**. Deobfuscation
+  changes belong there and are copied over; nothing in `deobf/` is edited here.
+  That repo's `CLAUDE.md`, `LURAPH.md` and `IRONBREW1.md` are the reference for
+  how the pipeline works.
+- `start.sh` - for a host that runs one command; restores the executable bit on
+  the Luau binaries and installs the dependencies on first boot.
 
-## The server's API (what `main.py` depends on)
+## Two engines, one interface
 
-From `web/server.py` upstream. Anything here changing upstream breaks the bot:
+`pick_engine()` returns `Local` when `DEOBF_API` is empty (the default) and
+`Api` when it is set. Both offer exactly three calls, so neither the command
+nor the embed knows which is behind them:
 
-- `GET /api/health` -> `{ok, luau, obfuscators:[{name,label,aliases}], advanced,
-  limits:{max_upload, job_timeout, result_ttl, rate_limit}, queue:{...}}`.
-  Read once at startup (`setup_hook`): it lowers `MAX_INPUT_BYTES` to the
-  server's own limit and warns when `luau` is false.
+- `start()` -> `{where, luau, max_input, queue, plugins}`, for the startup log
+  and `.status`. Raises `EngineError` when the engine is not usable.
+- `run(job, options, progress)` - fills in `job.result` or raises
+  `EngineError`; `await progress(job)` whenever something changed.
+- `log_tail(job)` - lines attached when a request fails.
+
+`Local` runs `deobf/deob.py` as a subprocess per request (plus one
+`--detect` first, for the label). `Api` drives the server's HTTP API.
+
+### The server's API (what `Api` depends on)
+
+From `web/server.py` upstream; a change there breaks this half.
+
+- `GET /api/health` -> `{ok, luau, obfuscators:[{name,label,aliases}], limits:
+  {max_upload, ...}, queue:{...}}`.
 - `POST /api/jobs` with JSON `{source, name, options}` -> 202 + the job's info.
   **`source` is the script decoded as latin-1**: the server re-encodes it the
-  same way, so every byte survives the JSON round trip. Sending UTF-8-decoded
-  text would corrupt any byte over 127.
-  `options` are `jobs.clean_options`' keys - `timeout`, `budget`, `executor`,
-  `no_devirt`, `obfuscator`, ... - and an unknown `obfuscator` is a 400.
-- `GET /api/jobs/{id}/events` - server-sent events: `log` (a list of lines),
-  `state` (the job's info, whenever it changes), one `end`. The bot only uses
-  the states; `info()["elapsed"]` changes every pass, so a state arrives about
-  three times a second, which is what the job deadline is checked against.
-- `GET /api/jobs/{id}` (one info), `/log?since=` (lines, attached on a
-  failure), `/result` (the Luau as text, 409 before it exists),
-  `DELETE /api/jobs/{id}` (cancel).
+  same way, so every byte survives the JSON round trip. UTF-8-decoded text
+  would corrupt any byte over 127.
+- `GET /api/jobs/{id}/events` - server-sent events: `log`, `state` (the job's
+  info, whenever it changes), one `end`. `info()["elapsed"]` changes every
+  pass, so a state arrives about three times a second, which is what the job
+  deadline is checked against.
+- `/api/jobs/{id}`, `/log?since=`, `/result` (409 before it exists),
+  `DELETE /api/jobs/{id}`.
 - `detected` in the job's info is the plugin's label **with the Luraph
-  version** ("Luraph v14.4.2"): that is what the embed shows, so there is no
-  need to call `/api/detect` separately.
+  version** ("Luraph v14.4.2"), so there is no need to call `/api/detect`.
 
 ## Rules that matter
 
-- **The GitHub Pages site is not an API.** It runs the pipeline inside the
-  visitor's browser; `/api/health` there is a 404. `DEOBF_API` has to be a real
-  `web/server.py`. When it is unreachable the bot says so in the channel and at
-  startup - never let that look like a deobfuscation failure.
+- **Never import the pipeline into this process.** `deob.py` keeps global state
+  (the Path2D cache, the last raw run), so `Local` spawns a subprocess per
+  request in its own temp folder. See the upstream `CLAUDE.md`, "Usage".
+- **`deobf/bin/luau` and `deobf/bin/luau-ast` are committed here** (they are
+  git-ignored upstream). Wispbyte has no compiler, so the binaries must ship.
+  They are built with `python deobf/build_luau.py --portable` - **`--portable`
+  matters**: the default build uses `-march=native` and would crash on a
+  different host's CPU. Statically linked, stripped, x86-64 Linux.
 - **The bot needs MESSAGE CONTENT INTENT.** Without it `on_message` sees empty
   content and the bot silently never answers.
+- **The GitHub Pages site is not an API.** It runs the pipeline inside the
+  visitor's browser; `/api/health` there is a 404. `DEOBF_API`, when set, has to
+  be a real `web/server.py`. When it is unreachable the bot says so in the
+  channel and at startup - never let that look like a deobfuscation failure.
 - Whether the result came from the lifter is read off its first line
-  (`TRACE_MARK`), not from what was asked for: the pipeline falls back to a
-  trace on its own (a Luraph VM older than v14, or a lift that failed), and the
-  embed has to say which one it is.
-- The deobf server has no authentication and runs untrusted scripts, so its
-  address is only shown to `OWNER_IDS` (`.status`), and `DEOBF_API_TOKEN` exists
-  for when it sits behind a proxy that checks one.
+  (`TRACE_MARK`, via `Job.note_lifted`), not from what was asked for: the
+  pipeline falls back to a trace on its own (a Luraph VM older than v14, or a
+  lift that failed), and the embed has to say which one it is.
+- `Local` holds a semaphore of `MAX_CONCURRENCY` (2) because each lift can want
+  a few hundred MB; waiting requests show "Queued" with how many are ahead.
+  `_kill` ends the whole process group - the pipeline starts children.
+- A deobf server has no authentication and runs untrusted scripts, so its
+  address only goes to `OWNER_IDS` (`.status`), and `DEOBF_API_TOKEN` exists for
+  when it sits behind a proxy that checks one.
 - A link anyone can type is fetched by this host, so `_public_host` refuses
   loopback, private, link-local and reserved addresses.
 - Discord edits are rate limited per channel; `Editor` never edits faster than
@@ -76,14 +98,18 @@ From `web/server.py` upstream. Anything here changing upstream breaks the bot:
 
 ## Checking a change
 
-No test suite, and `python main.py` needs a token. Check the parts that do not:
+No test suite, and `python main.py` needs a token. Check the parts that do not,
+**against both engines** - run the check once with `DEOBF_API` empty and once
+with it pointed at a `python web/server.py` from the upstream repo:
 
-- a real job end to end, against a server started from the upstream repo
-  (`python web/server.py`): build a `Job`, call `Bot._run` with stand-in
-  Discord objects, and assert the result matches `samples/output/` upstream.
-- the embeds: build `progress_embed`, `finished_embed` and `failed_embed` and
-  assert each `to_dict()` stays under Discord's 6000-character limit.
+- a real request end to end with stand-in Message/Attachment/Channel objects
+  driving `Bot.on_message`: the finished embed must carry the version, and the
+  attachment must equal the upstream `samples/output/` file byte for byte.
+- the legacy-Luraph sample: labelled with its version, reported as a
+  **Behaviour trace**, with the "lifting did not apply" note.
+- the embeds: `to_dict()` under Discord's 6000-character limit.
 - `raw_url` against the paste hosts it rewrites, and
   `fetch("http://127.0.0.1/...")` to confirm it is refused.
-- the unreachable-server path: point `DEOBF_API` at a closed port and confirm
-  the command answers with the "not answering" notice.
+- `DEOBF_API` at a closed port: the command must answer with the "not
+  answering" notice, and `setup_hook` must not raise.
+- `MAX_CONCURRENCY=1` with two requests at once: only one subprocess runs.
