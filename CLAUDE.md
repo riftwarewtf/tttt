@@ -4,68 +4,86 @@
 > to rediscover, and replace outdated text instead of appending to it.
 > **Hard limit: 200 lines.**
 
-A Discord bot around the `deobf` pipeline. One command, `.deobf`, takes a
-protected Roblox Luau script (attachment, paste link, or a reply to a message
-with either), detects the obfuscator and sends readable Luau back, editing one
-embed from "queued" to the finished file. `README.md` is the user-facing
+One command, `.deobf`, takes a protected Roblox Luau script (attachment, paste
+link, or a reply to a message with either) and sends readable Luau back, editing
+one embed from "queued" to the finished file. `README.md` is the user-facing
 documentation, including the Wispbyte steps.
+
+**The bot does no deobfuscating.** It posts the script to a **deobf server** -
+the `web/` half of [riftwarewtf/deobf](https://github.com/riftwarewtf/deobf) -
+and follows that job. So this repository is one file plus its packaging: no
+pipeline, no Luau binaries, two pip dependencies.
 
 ## Layout
 
-- `bot.py` — entry point (`python bot.py`); `start.sh` is the same thing for a
-  host that runs one command, and also restores the executable bit on the
-  Luau binaries (a GitHub zip download drops it).
-- `bot/client.py` — the Discord side: the command, the embed lifecycle, the
-  reply. `bot/runner.py` — the pipeline: detection, one `deob.py` subprocess
-  per request, the stage callback, the bounded queue.
-  `bot/sources.py` — attachments and links. `bot/embeds.py` — the embed and
-  its throttled editor. `bot/config.py` — settings from the environment and
-  from `.env`.
-- `deobf/` — **a copy of the pipeline from
-  [riftwarewtf/deobf](https://github.com/riftwarewtf/deobf)**. Deobfuscation
-  changes belong there and are copied over; nothing in `deobf/` is edited
-  here. That repo's `CLAUDE.md`, `LURAPH.md` and `IRONBREW1.md` are the
-  reference for how the pipeline works.
+- `main.py` - everything, in five sections: settings (`.env` + environment),
+  the API client (`Api`), the input (paste links, the SSRF guard), the embed
+  (`Job`, the `*_embed` builders, `Editor`), and the Discord client (`Bot`).
+- `start.sh` - the same thing for a host that runs one command; installs the
+  dependencies on first boot.
+- `.env.example` - every setting, annotated. `requirements.txt` - discord.py,
+  aiohttp.
+
+## The server's API (what `main.py` depends on)
+
+From `web/server.py` upstream. Anything here changing upstream breaks the bot:
+
+- `GET /api/health` -> `{ok, luau, obfuscators:[{name,label,aliases}], advanced,
+  limits:{max_upload, job_timeout, result_ttl, rate_limit}, queue:{...}}`.
+  Read once at startup (`setup_hook`): it lowers `MAX_INPUT_BYTES` to the
+  server's own limit and warns when `luau` is false.
+- `POST /api/jobs` with JSON `{source, name, options}` -> 202 + the job's info.
+  **`source` is the script decoded as latin-1**: the server re-encodes it the
+  same way, so every byte survives the JSON round trip. Sending UTF-8-decoded
+  text would corrupt any byte over 127.
+  `options` are `jobs.clean_options`' keys - `timeout`, `budget`, `executor`,
+  `no_devirt`, `obfuscator`, ... - and an unknown `obfuscator` is a 400.
+- `GET /api/jobs/{id}/events` - server-sent events: `log` (a list of lines),
+  `state` (the job's info, whenever it changes), one `end`. The bot only uses
+  the states; `info()["elapsed"]` changes every pass, so a state arrives about
+  three times a second, which is what the job deadline is checked against.
+- `GET /api/jobs/{id}` (one info), `/log?since=` (lines, attached on a
+  failure), `/result` (the Luau as text, 409 before it exists),
+  `DELETE /api/jobs/{id}` (cancel).
+- `detected` in the job's info is the plugin's label **with the Luraph
+  version** ("Luraph v14.4.2"): that is what the embed shows, so there is no
+  need to call `/api/detect` separately.
 
 ## Rules that matter
 
-- **Never import the pipeline into this process.** `deob.py` keeps global
-  state (the Path2D cache, the last raw run), so every request is its own
-  subprocess in its own temp folder. See the upstream `CLAUDE.md`, "Usage".
-- **`deobf/bin/luau` and `deobf/bin/luau-ast` are committed here** (they are
-  git-ignored upstream). Wispbyte has no compiler, so the binaries must ship.
-  They are built with `python deobf/build_luau.py --portable` — **`--portable`
-  matters**: the default build uses `-march=native` and would crash on a
-  different host's CPU. They are statically linked, stripped, x86-64 Linux.
+- **The GitHub Pages site is not an API.** It runs the pipeline inside the
+  visitor's browser; `/api/health` there is a 404. `DEOBF_API` has to be a real
+  `web/server.py`. When it is unreachable the bot says so in the channel and at
+  startup - never let that look like a deobfuscation failure.
 - **The bot needs MESSAGE CONTENT INTENT.** Without it `on_message` sees empty
   content and the bot silently never answers.
-- The generic plugin has no lifter, so `runner.Run` turns devirtualization off
-  for it: leaving it on would spend the whole timeout to produce the same
-  trace. Whether the result actually came from the lifter is read back off the
-  output's first line (`runner.TRACE_MARK`), not from what was asked for - the
-  pipeline falls back to a trace on its own (a Luraph VM older than v14, or a
-  lift that failed), and the embed has to say which one it is.
-- A link anyone can type is fetched by the host, so `sources._public_host`
-  refuses loopback, private, link-local and reserved addresses.
-- Discord edits are rate limited per channel; `embeds.Editor` never edits
-  faster than `EDIT_INTERVAL` (2 s) and keeps the last state to send when the
-  interval is up.
-- Attachments cannot be added to a message by editing its embed alone: the
-  final edit passes `attachments=[...]`, and falls back to a follow-up message
-  if that fails.
+- Whether the result came from the lifter is read off its first line
+  (`TRACE_MARK`), not from what was asked for: the pipeline falls back to a
+  trace on its own (a Luraph VM older than v14, or a lift that failed), and the
+  embed has to say which one it is.
+- The deobf server has no authentication and runs untrusted scripts, so its
+  address is only shown to `OWNER_IDS` (`.status`), and `DEOBF_API_TOKEN` exists
+  for when it sits behind a proxy that checks one.
+- A link anyone can type is fetched by this host, so `_public_host` refuses
+  loopback, private, link-local and reserved addresses.
+- Discord edits are rate limited per channel; `Editor` never edits faster than
+  `EDIT_INTERVAL` (2 s) and keeps the last state to send when the interval is up.
+- Attachments cannot be added to a message by editing its embed alone: the final
+  edit passes `attachments=[...]`, and falls back to a follow-up message.
+- `Api.follow` is an async generator holding a streaming response open, so it is
+  closed with `aclose()` in a `finally` - not left to the garbage collector, and
+  never wrapped in `asyncio.wait_for` (cancelling it there leaks the response).
 
 ## Checking a change
 
-There is no test suite. `python bot.py` needs a token, so check the parts that
-do not:
+No test suite, and `python main.py` needs a token. Check the parts that do not:
 
-- a real run end to end, without Discord: build a `runner.Run` with a sample's
-  bytes and `await runner.Queue(...).submit(run)`, then build every embed from
-  the result (`embeds.progress`, `finished`, `failed`) and assert each
-  `to_dict()` stays under Discord's 6000-character limit. Samples live in the
-  upstream repo (`samples/001_vm_like_dispatch-obfuscated.lua` for Luraph,
-  `001_vm_like_dispatch-ib1.lua` for IronBrew).
-- `sources.raw_url` against the paste hosts it rewrites, and
-  `sources.fetch("http://127.0.0.1/...")` to confirm it is refused.
-- `python deobf/deob.py <sample> --detect` and a plain full run, to confirm
-  the committed binaries still work.
+- a real job end to end, against a server started from the upstream repo
+  (`python web/server.py`): build a `Job`, call `Bot._run` with stand-in
+  Discord objects, and assert the result matches `samples/output/` upstream.
+- the embeds: build `progress_embed`, `finished_embed` and `failed_embed` and
+  assert each `to_dict()` stays under Discord's 6000-character limit.
+- `raw_url` against the paste hosts it rewrites, and
+  `fetch("http://127.0.0.1/...")` to confirm it is refused.
+- the unreachable-server path: point `DEOBF_API` at a closed port and confirm
+  the command answers with the "not answering" notice.
